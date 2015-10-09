@@ -34,8 +34,8 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#define LOG_TAG "Cryptfs_HW"
 #include "cutils/log.h"
-#include "cutils/properties.h"
 #include "cutils/android_reboot.h"
 
 
@@ -46,30 +46,17 @@
 // wipe userdata partition once this error is received.
 #define ERR_MAX_PASSWORD_ATTEMPTS -10
 #define QSEECOM_DISK_ENCRYPTION 1
-#define QSEECOM_ICE_DISK_ENCRYPTION 3
 #define MAX_PASSWORD_LEN 32
 
 /* Operations that be performed on HW based device encryption key */
 #define SET_HW_DISK_ENC_KEY 1
 #define UPDATE_HW_DISK_ENC_KEY 2
-#define MAX_DEVICE_ID_LENGTH 4 /* 4 = 3 (MAX_SOC_ID_LENGTH) + 1 */
-
-static unsigned int cpu_id[] = {
-	239, /* MSM8939 SOC ID */
-};
 
 static int loaded_library = 0;
 static unsigned char current_passwd[MAX_PASSWORD_LEN];
 static int (*qseecom_create_key)(int, void*);
 static int (*qseecom_update_key)(int, void*, void*);
 static int (*qseecom_wipe_key)(int);
-
-static int map_usage(int usage)
-{
-    return (is_ice_enabled() && (usage == QSEECOM_DISK_ENCRYPTION)) ?
-                                          QSEECOM_ICE_DISK_ENCRYPTION : usage;
-}
-
 
 static unsigned char* get_tmp_passwd(const char* passwd)
 {
@@ -90,52 +77,29 @@ static unsigned char* get_tmp_passwd(const char* passwd)
     return tmp_passwd;
 }
 
-static void wipe_userdata()
-{
-    mkdir("/cache/recovery", 0700);
-    int fd = open("/cache/recovery/command", O_RDWR|O_CREAT|O_TRUNC|O_NOFOLLOW, 0600);
-    if (fd >= 0) {
-        write(fd, "--wipe_data", strlen("--wipe_data") + 1);
-        close(fd);
-    } else {
-        SLOGE("could not open /cache/recovery/command\n");
-    }
-    android_reboot(ANDROID_RB_RESTART2, 0, "recovery");
-}
-
 static int load_qseecom_library()
 {
     const char *error = NULL;
     if (loaded_library)
         return loaded_library;
 
-#ifdef __LP64__
-    void * handle = dlopen("/vendor/lib64/libQSEEComAPI.so", RTLD_NOW);
-#else
-    void * handle = dlopen("/vendor/lib/libQSEEComAPI.so", RTLD_NOW);
-#endif
+    void * handle = dlopen("libQSEEComAPI.so", RTLD_NOW);
     if(handle) {
         dlerror(); /* Clear any existing error */
         *(void **) (&qseecom_create_key) = dlsym(handle,"QSEECom_create_key");
 
         if((error = dlerror()) == NULL) {
-            SLOGD("Success loading QSEECom_create_key \n");
             *(void **) (&qseecom_update_key) = dlsym(handle,"QSEECom_update_key_user_info");
-            if ((error = dlerror()) == NULL) {
-                SLOGD("Success loading QSEECom_update_key_user_info\n");
+            if((error = dlerror()) == NULL) {
                 *(void **) (&qseecom_wipe_key) = dlsym(handle,"QSEECom_wipe_key");
-                if ((error = dlerror()) == NULL) {
-                    loaded_library = 1;
-                    SLOGD("Success loading QSEECom_wipe_key \n");
-                }
+                if ((error = dlerror()) == NULL)
+                  loaded_library = 1;
                 else
-                    SLOGE("Error %s loading symbols for QSEECom APIs \n", error);
+                  SLOGE("Error %s loading symbols for QSEECom APIs", error);
             }
-            else
-                SLOGE("Error %s loading symbols for QSEECom APIs \n", error);
         }
     } else {
-        SLOGE("Could not load libQSEEComAPI.so \n");
+        SLOGE("Could not load libQSEEComAPI.so");
     }
 
     if(error)
@@ -144,42 +108,42 @@ static int load_qseecom_library()
     return loaded_library;
 }
 
-/*
- * For NON-ICE targets, it would return 0 on success. On ICE based targets,
- * it would return key index in the ICE Key LUT
- */
-static int set_key(const char* passwd, const char* enc_mode, int operation)
+static unsigned int set_key(const char* passwd, const char* enc_mode, int operation)
 {
+    int ret = 0;
     int err = -1;
     if (is_hw_disk_encryption(enc_mode) && load_qseecom_library()) {
         unsigned char* tmp_passwd = get_tmp_passwd(passwd);
         if(tmp_passwd) {
-            if (operation == UPDATE_HW_DISK_ENC_KEY)
-                err = qseecom_update_key(map_usage(QSEECOM_DISK_ENCRYPTION), current_passwd, tmp_passwd);
-            else if (operation == SET_HW_DISK_ENC_KEY)
-                err = qseecom_create_key(map_usage(QSEECOM_DISK_ENCRYPTION), tmp_passwd);
 
-            if(err >= 0) {
+            if (operation == UPDATE_HW_DISK_ENC_KEY)
+                err = qseecom_update_key(QSEECOM_DISK_ENCRYPTION, current_passwd, tmp_passwd);
+            else if (operation == SET_HW_DISK_ENC_KEY)
+                err = qseecom_create_key(QSEECOM_DISK_ENCRYPTION, tmp_passwd);
+
+            if(!err) {
                 memset(current_passwd, 0, MAX_PASSWORD_LEN);
                 memcpy(current_passwd, tmp_passwd, MAX_PASSWORD_LEN);
+                ret = 1;
             } else {
                 if(ERR_MAX_PASSWORD_ATTEMPTS == err)
-                    wipe_userdata();
+                    SLOGE("Maximum password attempts reached. Need factory data reset to recover.");
             }
             free(tmp_passwd);
         }
     }
-    return err;
+    return ret;
 }
 
-int set_hw_device_encryption_key(const char* passwd, const char* enc_mode)
+unsigned int set_hw_device_encryption_key(const char* passwd, const char* enc_mode)
 {
+    SLOGI("Set key for HW disk encryption operation");
     return set_key(passwd, enc_mode, SET_HW_DISK_ENC_KEY);
 }
 
-int update_hw_device_encryption_key(const char* newpw, const char* enc_mode)
+unsigned int update_hw_device_encryption_key(const char* newpw, const char* enc_mode)
 {
-
+    SLOGI("Update key for HW disk encryption operation");
     return set_key(newpw, enc_mode, UPDATE_HW_DISK_ENC_KEY);
 }
 
@@ -188,106 +152,22 @@ unsigned int is_hw_disk_encryption(const char* encryption_mode)
     int ret = 0;
     if(encryption_mode) {
         if (!strcmp(encryption_mode, "aes-xts")) {
-            SLOGD("HW based disk encryption is enabled \n");
             ret = 1;
         }
     }
     return ret;
 }
 
-unsigned int wipe_hw_device_encryption_key(const char* enc_mode)
+unsigned int clear_hw_device_encryption_key()
 {
-    if (!enc_mode)
-        return -1;
-
-    if (is_hw_disk_encryption(enc_mode) && load_qseecom_library())
-        return qseecom_wipe_key(QSEECOM_DISK_ENCRYPTION);
-
-    return 0;
-}
-
-/*
- * By default HW FDE is enabled, if the execution comes to
- * is_hw_fde_enabled() API then for specific device/soc id,
- * HW FDE is disabled.
- */
-#ifdef CONFIG_SWV8_DISK_ENCRYPTION
-unsigned int is_hw_fde_enabled(void)
-{
-    unsigned int device_id = -1;
-    unsigned int array_size;
-    unsigned int status = 1;
-    FILE *fd = NULL;
-    unsigned int i;
-    int ret = -1;
-    char buf[MAX_DEVICE_ID_LENGTH];
-
-    fd = fopen("/sys/devices/soc0/soc_id", "r");
-    if (fd) {
-        ret = fread(buf, 1, MAX_DEVICE_ID_LENGTH, fd);
-        fclose(fd);
-    } else {
-        fd = fopen("/sys/devices/system/soc/soc0/id", "r");
-        if (fd) {
-            ret = fread(buf, 1, MAX_DEVICE_ID_LENGTH, fd);
-            fclose(fd);
-        }
+    int err = -1;
+    int rc = 0;
+    SLOGI("Clear HW disk encryption key");
+    if (load_qseecom_library()) {
+        err = qseecom_wipe_key(1);
     }
 
-    if (ret > 0) {
-        device_id = atoi(buf);
-    } else {
-        SLOGE("Failed to read device id");
-        return status;
-    }
+    if (!err) rc = 1;
 
-    array_size = sizeof(cpu_id) / sizeof(cpu_id[0]);
-    for (i = 0; i < array_size; i++) {
-        if (device_id == cpu_id[i]) {
-            status = 0;
-            break;
-        }
-    }
-
-    return status;
-}
-#else
-unsigned int is_hw_fde_enabled(void)
-{
-    return 1;
-}
-#endif
-
-int is_ice_enabled(void)
-{
-    /* If (USE_ICE_FLAG) => return 1
-     * if (property set to use gpce) return 0
-     * we are using property to test UFS + GPCE, even though not required
-     * if (storage is ufs) return 1
-     * else return 0 so that emmc based device can work properly
-     */
-#ifdef USE_ICE_FOR_STORAGE_ENCRYPTION
-    SLOGD("Ice enabled = true");
-    return 1;
-#else
-    char enc_hw_type[PATH_MAX];
-    char prop_storage[PATH_MAX];
-    int ice = 0;
-    int i;
-    if (property_get("crypto.fde_enc_hw_type", enc_hw_type, "")) {
-        if(!strncmp(enc_hw_type, "gpce", PROPERTY_VALUE_MAX)) {
-            SLOGD("GPCE would be used for HW FDE");
-            return 0;
-        }
-    }
-
-    if (property_get("ro.boot.bootdevice", prop_storage, "")) {
-        if(strstr(prop_storage, "ufs")) {
-            SLOGD("ICE would be used for HW FDE");
-            return 1;
-        }
-    }
-    SLOGD("GPCE would be used for HW FDE");
-    return 0;
-#endif
+    return rc;
 }
