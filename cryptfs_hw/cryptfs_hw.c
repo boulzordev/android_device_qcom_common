@@ -322,16 +322,3 @@ int should_use_keymaster()
 
     return 1;
 }
-unsigned int clear_hw_device_encryption_key()
-{
-    int err = -1;
-    int rc = 0;
-    SLOGI("Clear HW disk encryption key");
-    if (load_qseecom_library()) {
-        err = qseecom_wipe_key(1);
-    }
-
-    if (!err) rc = 1;
-
-    return rc;
-}
